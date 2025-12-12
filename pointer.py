@@ -8,7 +8,6 @@ import math
 # Optimize pyautogui
 pyautogui.FAILSAFE = False
 
-
 def main():
     # Initialize MediaPipe Hands
     mp_hands = mp.solutions.hands
@@ -18,6 +17,16 @@ def main():
         min_detection_confidence=0.7,
         min_tracking_confidence=0.5
     )
+    
+    # Initialize MediaPipe Face Mesh (for Blinks)
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+    
     mp_draw = mp.solutions.drawing_utils
 
     # Open Webcam
@@ -38,15 +47,12 @@ def main():
     plocX, plocY = 0, 0
     clocX, clocY = 0, 0
 
-    # Click Logic
-    pinch_start_time = 0
-    pinch_active = False
+    # Blink Logic
+    blink_thresh = 0.012
+    click_cooldown = 0
+    click_delay = 15 # Frames
     
-    # Logic:
-    # - Pinch & Release quickly (< 0.4s) --> Left Click
-    # - Pinch & Hold (> 0.4s) --> Right Click
-    
-    print("Mouse Pointer Application Started. Press 'q' to exit.")
+    print("Pointer App with Eye Clicks Started. Press 'q' to exit.")
 
     while True:
         success, img = cap.read()
@@ -55,72 +61,75 @@ def main():
             break
         
         # Mirror image for natural feeling
-        img = cv2.flip(img, 1)
+        img = cv2.flip(img, 1) # 1 = horizontal flip
+        h, w, c = img.shape
 
         # Convert to RGB for MediaPipe
         imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = hands.process(imgRGB)
+        
+        # 1. Process Hands (Cursor)
+        results_hands = hands.process(imgRGB)
+        
+        # 2. Process Face (Clicks)
+        results_face = face_mesh.process(imgRGB)
 
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
+        # --- CURSOR MOVEMENT (HANDS) ---
+        if results_hands.multi_hand_landmarks:
+            for hand_landmarks in results_hands.multi_hand_landmarks:
                 mp_draw.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
                 lmList = []
                 for id, lm in enumerate(hand_landmarks.landmark):
-                    h, w, c = img.shape
                     cx, cy = int(lm.x * w), int(lm.y * h)
                     lmList.append([id, cx, cy])
 
                 if len(lmList) != 0:
                     x1, y1 = lmList[8][1], lmList[8][2] # Index Tip
-                    x2, y2 = lmList[4][1], lmList[4][2] # Thumb Tip
                     
-                    # 1. Convert Coordinates
-                    # Map range from frameR to wCam-frameR => 0 to wScr
+                    # Convert Coordinates
                     x3 = np.interp(x1, (frameR, wCam - frameR), (0, wScr))
                     y3 = np.interp(y1, (frameR, hCam - frameR), (0, hScr))
                     
-                    # 2. Smoothen Values
+                    # Smoothen Values
                     clocX = plocX + (x3 - plocX) / smoothening
                     clocY = plocY + (y3 - plocY) / smoothening
                     
-                    # 3. Move Mouse
-                    pyautogui.moveTo(clocX, clocY)
+                    # Move Mouse
+                    try:
+                        pyautogui.moveTo(clocX, clocY)
+                    except pyautogui.FailSafeException:
+                        pass
+                    
                     plocX, plocY = clocX, clocY
                     
-                    # 4. Clicking Mode
-                    length = math.hypot(x2 - x1, y2 - y1)
-                    
-                    # Visual feedback
+                    # Visual feedback for pointer
                     cv2.circle(img, (x1, y1), 15, (255, 0, 255), cv2.FILLED)
+
+        # --- CLICK LOGIC (EYES/FACE) ---
+        if results_face.multi_face_landmarks:
+            face_landmarks = results_face.multi_face_landmarks[0].landmark
+            
+            # Left Eye: 159 (Top), 145 (Bottom)
+            # Right Eye: 386 (Top), 374 (Bottom)
+            
+            left_dist = abs(face_landmarks[159].y - face_landmarks[145].y)
+            right_dist = abs(face_landmarks[386].y - face_landmarks[374].y)
+            
+            if click_cooldown == 0:
+                # LEFT CLICK (Left Blink)
+                if left_dist < blink_thresh and right_dist > blink_thresh:
+                    pyautogui.click(button='left')
+                    cv2.putText(img, "LEFT CLICK", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+                    click_cooldown = click_delay
                     
-                    # --- NEW CLICK LOGIC ---
-                    if length < 40: # Pinch IS active
-                        cv2.circle(img, (x1, y1), 15, (0, 255, 0), cv2.FILLED)
-                        
-                        if not pinch_active:
-                            # Just started pinching
-                            pinch_active = True
-                            pinch_start_time = time.time()
-                        
-                        # Check for HOLD (Right Click)
-                        if pinch_active and (time.time() - pinch_start_time > 0.4):
-                            if pinch_start_time != 0: # Ensure we haven't handled this yet
-                                print("Right Click (Hold)")
-                                pyautogui.rightClick()
-                                pinch_start_time = 0 # Mark as handled
-                                
-                    else: # Pinch is NOT active
-                        if pinch_active:
-                            # Just released pinch
-                            # Check if it was a short tap and wasn't handled as Hold yet
-                            if pinch_start_time != 0 and (time.time() - pinch_start_time < 0.4):
-                                print("Left Click (Tap)")
-                                pyautogui.click()
-                            
-                            pinch_active = False
-                            pinch_start_time = 0
-                    # -----------------------
+                # RIGHT CLICK (Right Blink)
+                elif right_dist < blink_thresh and left_dist > blink_thresh:
+                    pyautogui.click(button='right')
+                    cv2.putText(img, "RIGHT CLICK", (w-250, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+                    click_cooldown = click_delay
+        
+        if click_cooldown > 0:
+            click_cooldown -= 1
 
         # Draw Frame Reduction Box
         cv2.rectangle(img, (frameR, frameR), (wCam - frameR, hCam - frameR), (255, 0, 255), 2)
@@ -128,10 +137,9 @@ def main():
         # FPS
         cTime = time.time()
         fps = 1 / (cTime - 0.001) if (cTime - 0.001) > 0 else 0
-        
-        cv2.putText(img, str(int(fps)), (20, 50), cv2.FONT_HERSHEY_PLAIN, 3, (255, 0, 0), 3)
+        cv2.putText(img, str(int(fps)), (20, h - 20), cv2.FONT_HERSHEY_PLAIN, 3, (255, 0, 0), 3)
 
-        cv2.imshow("Image", img)
+        cv2.imshow("Pointer App", img)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
